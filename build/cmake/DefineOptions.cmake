@@ -68,6 +68,11 @@ endif()
 CMAKE_DEPENDENT_OPTION(BUILD_CPP "Build C++ library" ON
                        "BUILD_LIBRARIES;WITH_CPP" OFF)
 
+# C11
+option(WITH_C11 "Build dependency-free C11 Thrift library" ON)
+CMAKE_DEPENDENT_OPTION(BUILD_C11 "Build C11 library" ON
+                       "BUILD_LIBRARIES;WITH_C11" OFF)
+
 # C GLib
 option(WITH_C_GLIB "Build C (GLib) Thrift library" ON)
 if(WITH_C_GLIB)
@@ -177,6 +182,7 @@ if (BUILD_CPP)
     message(STATUS "    Build with ZLIB support:                  ${WITH_ZLIB}")
 endif ()
 message(STATUS)
+message(STATUS "  Build C11 library:                          ${BUILD_C11}")
 message(STATUS "  Build C (GLib) library:                     ${BUILD_C_GLIB}")
 MESSAGE_DEP(WITH_C_GLIB "Disabled by WITH_C_GLIB=OFF")
 MESSAGE_DEP(GLIB_FOUND "GLib missing")

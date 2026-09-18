@@ -1,0 +1,199 @@
+--- a/include/civetweb.h
++++ b/include/civetweb.h
+@@ -660,6 +660,15 @@
+    data pointer in the user defined data structure and modify that
+    pointer. In either case, after the init_connection callback, only
+    calls to mg_get_user_connection_data should be required. */
++/* Thrift C11 bounded WebSocket reader extension, revision 1.
++ * Call from the connect/ready callback; returns 1 on success, 0 for invalid arguments.
++ * Enforces client masking and max_frame_size before payload allocation, plus
++ * an idle/whole-frame timeout that partial bytes do not reset. */
++#define MG_WEBSOCKET_LIMITS_VERSION 1
++CIVETWEB_API int mg_set_websocket_limits(const struct mg_connection *conn,
++                                        size_t max_frame_size,
++                                        unsigned timeout_ms);
++
+ CIVETWEB_API void mg_set_user_connection_data(const struct mg_connection *conn,
+                                               void *data);
+ 
+--- a/src/civetweb.c
++++ b/src/civetweb.c
+@@ -2538,6 +2538,8 @@
+ 	                       * pages */
+ #if defined(USE_WEBSOCKET)
+ 	int in_websocket_handling; /* 1 if in read_websocket */
++	size_t websocket_frame_limit; /* zero preserves upstream behavior */
++	unsigned websocket_frame_timeout_ms;
+ #endif
+ #if defined(USE_ZLIB) && defined(USE_WEBSOCKET)                                \
+     && defined(MG_EXPERIMENTAL_INTERFACES)
+@@ -13116,6 +13118,53 @@
+ #endif
+ 
+ 
++enum {
++    WEBSOCKET_PROTOCOL_CLOSE = 1002,
++    WEBSOCKET_SIZE_CLOSE = 1009,
++    WEBSOCKET_CLOSE_BYTES = 2,
++    WEBSOCKET_MILLISECONDS_PER_SECOND = 1000
++};
++
++/* Thrift C11 extension, revision 1. Configure only in the connect/ready callback.
++ * Both a finite frame bound and deadline are mandatory; masking is enforced.
++ * No allocation or I/O occurs here. */
++CIVETWEB_API int
++mg_set_websocket_limits(const struct mg_connection *connection, size_t max_frame_size,
++                        unsigned timeout_ms)
++{
++	struct mg_connection *conn = (struct mg_connection *)connection;
++	if (!conn || !max_frame_size || max_frame_size > INT_MAX || !timeout_ms
++	    || timeout_ms > INT_MAX) {
++		return 0;
++	}
++	conn->websocket_frame_limit = max_frame_size;
++	conn->websocket_frame_timeout_ms = timeout_ms;
++	return 1;
++}
++
++/* Use CivetWeb's portable monotonic clock, including its Windows backend.
++ * Failure expires the deadline rather than disabling protection. */
++static double
++websocket_frame_time(void)
++{
++	struct timespec now;
++	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
++		return -1.0;
++	}
++	return (double)now.tv_sec + (double)now.tv_nsec / 1.0E9;
++}
++
++static int
++websocket_frame_remaining(double deadline, double *remaining)
++{
++	double now = websocket_frame_time();
++	if (now < 0.0 || now >= deadline) {
++		return 0;
++	}
++	*remaining = deadline - now;
++	return 1;
++}
++
+ static void
+ read_websocket(struct mg_connection *conn,
+                mg_websocket_data_handler ws_data_handler,
+@@ -13151,6 +13200,8 @@
+ 	double timeout = -1.0;
+ 	int enable_ping_pong = 0;
+ 	int ping_count = 0;
++	double frame_deadline = 0.0;
++	int bounded = conn->websocket_frame_limit != 0;
+ 
+ 	if (conn->dom_ctx->config[ENABLE_WEBSOCKET_PING_PONG]) {
+ 		enable_ping_pong =
+@@ -13166,6 +13217,14 @@
+ 	}
+ 	if (timeout <= 0.0) {
+ 		timeout = atof(config_options[REQUEST_TIMEOUT].default_value) / 1000.0;
++	}
++
++	if (bounded) {
++		double now = websocket_frame_time();
++		if (now < 0.0) {
++			return;
++		}
++		frame_deadline = now + (double)conn->websocket_frame_timeout_ms / WEBSOCKET_MILLISECONDS_PER_SECOND;
+ 	}
+ 
+ 	/* Enter data processing loop */
+@@ -13179,9 +13238,23 @@
+ 	 * callback, and waiting repeatedly until an error occurs. */
+ 	while (STOP_FLAG_IS_ZERO(&conn->phys_ctx->stop_flag)
+ 	       && (!conn->must_close)) {
++		if (bounded && !websocket_frame_remaining(frame_deadline, &timeout)) {
++			break;
++		}
+ 		header_len = 0;
+ 		DEBUG_ASSERT(conn->data_len >= conn->request_len);
+ 		if ((body_len = (size_t)(conn->data_len - conn->request_len)) >= 2) {
++			/* Reject missing client masking before reading extended lengths or
++			 * allocating a payload. The data callback cannot see this bit. */
++			if (bounded && (!(buf[1] & 128) || (buf[0] & 0x70))) {
++				const char protocol_close[WEBSOCKET_CLOSE_BYTES] = {
++				    WEBSOCKET_PROTOCOL_CLOSE >> 8, (char)(WEBSOCKET_PROTOCOL_CLOSE & 0xff)};
++				if (mg_websocket_write(conn, MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE,
++				                       protocol_close, sizeof(protocol_close)) < 0) {
++					conn->must_close = 1;
++				}
++				break;
++			}
+ 			len = buf[1] & 127;
+ 			mask_len = (buf[1] & 128) ? 4 : 0;
+ 			if ((len < 126) && (body_len >= mask_len)) {
+@@ -13212,6 +13285,16 @@
+ 		}
+ 
+ 		if ((header_len > 0) && (body_len >= header_len)) {
++			/* The header alone is sufficient to reject oversized frames. */
++			if (bounded && data_len > conn->websocket_frame_limit) {
++				const char size_close[WEBSOCKET_CLOSE_BYTES] = {
++				    WEBSOCKET_SIZE_CLOSE >> 8, (char)(WEBSOCKET_SIZE_CLOSE & 0xff)};
++				if (mg_websocket_write(conn, MG_WEBSOCKET_OPCODE_CONNECTION_CLOSE,
++				                       size_close, sizeof(size_close)) < 0) {
++					conn->must_close = 1;
++				}
++				break;
++			}
+ 			/* Allocate space to hold websocket payload */
+ 			unsigned char *data = mem;
+ 
+@@ -13246,12 +13329,16 @@
+ 				memcpy(data, buf + header_len, len);
+ 				error = 0;
+ 				while ((uint64_t)len < data_len) {
++					if (bounded && !websocket_frame_remaining(frame_deadline, &timeout)) {
++						error = 1;
++						break;
++					}
+ 					n = pull_inner(NULL,
+ 					               conn,
+ 					               (char *)(data + len),
+ 					               (int)(data_len - len),
+ 					               timeout);
+-					if (n <= -2) {
++					if (n <= -2 || (bounded && n <= 0)) {
+ 						error = 1;
+ 						break;
+ 					} else if (n > 0) {
+@@ -13440,6 +13527,14 @@
+ 				break;
+ 			}
+ 
++			/* Reset only after a complete frame, never for partial progress. */
++			if (bounded) {
++				double now = websocket_frame_time();
++				if (now < 0.0) {
++					break;
++				}
++				frame_deadline = now + (double)conn->websocket_frame_timeout_ms / WEBSOCKET_MILLISECONDS_PER_SECOND;
++			}
+ 			/* Not breaking the loop, process next websocket frame. */
+ 		} else {
+ 			/* Read from the socket into the next available location in the
+@@ -13449,7 +13544,7 @@
+ 			               conn->buf + conn->data_len,
+ 			               conn->buf_size - conn->data_len,
+ 			               timeout);
+-			if (n <= -2) {
++			if (n <= -2 || (bounded && n <= 0)) {
+ 				/* Error, no bytes read */
+ 				DEBUG_TRACE("PULL from %s:%u failed",
+ 				            conn->request_info.remote_addr,
+@@ -13499,6 +13594,8 @@
+ 	/* Leave data processing loop */
+ 	mg_set_thread_name("worker");
+ 	conn->in_websocket_handling = 0;
++	conn->websocket_frame_limit = 0;
++	conn->websocket_frame_timeout_ms = 0;
+ 	DEBUG_TRACE("Websocket connection %s:%u left data processing loop",
+ 	            conn->request_info.remote_addr,
+ 	            conn->request_info.remote_port);
